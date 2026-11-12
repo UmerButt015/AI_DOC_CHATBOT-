@@ -1,0 +1,35 @@
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+ai/
+venv/
+.venv/
+env/
+ENV/
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter / editor files
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# Project generated data
+uploads/
+chroma_db/
+*.sqlite3
+
+# OS files
+.DS_Store
+Thumbs.db
