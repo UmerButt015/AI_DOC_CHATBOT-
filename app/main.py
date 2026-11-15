@@ -236,6 +236,17 @@ async def clear_chat_session(session_id: str = Form(...)):
     return {"message": f"Session '{session_id}' cleared."}
 
 
+@app.get("/")
+async def root():
+    """Return a friendly response for the base domain."""
+    return {
+        "status": "ok",
+        "message": "API is running",
+        "docs": "/docs",
+        "health": "/health",
+    }
+
+
 @app.get("/health")
 async def health():
     from app.redis_utils import get_redis_client

@@ -15,11 +15,11 @@ def get_redis_client():
     if not settings.REDIS_URL or redis is None:
         return None
 
-    client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
     try:
+        client = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
         client.ping()
         return client
-    except redis.exceptions.RedisError:
+    except (redis.exceptions.RedisError, ValueError, TypeError):
         return None
 
 
