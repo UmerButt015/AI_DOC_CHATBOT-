@@ -1,3 +1,4 @@
+import uuid
 from functools import lru_cache
 
 from langchain_chroma import Chroma
@@ -17,7 +18,10 @@ def get_embeddings():
     return HuggingFaceEmbeddings(
         model_name=settings.EMBEDDING_MODEL,
         model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True},
+        encode_kwargs={
+            "normalize_embeddings": True,
+            "batch_size": settings.EMBEDDING_BATCH_SIZE,
+        },
     )
 
 
@@ -43,15 +47,21 @@ def load_and_split_pdf(pdf_path: str) -> list[Document]:
 
 
 def create_vector_store(pdf_path: str, collection_name: str = "documents"):
-    """Create and persist a Chroma vector store from a PDF."""
+    """Create and persist a Chroma vector store from a PDF using smaller batches."""
     chunks = load_and_split_pdf(pdf_path)
+    embeddings = get_embeddings()
 
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=get_embeddings(),
-        persist_directory=settings.CHROMA_DIR,
+    vectorstore = Chroma(
         collection_name=collection_name,
+        embedding_function=embeddings,
+        persist_directory=settings.CHROMA_DIR,
     )
+
+    batch_size = settings.CHROMA_BATCH_SIZE
+    for start in range(0, len(chunks), batch_size):
+        batch = chunks[start : start + batch_size]
+        ids = [f"{collection_name}_{start + idx}_{uuid.uuid4().hex}" for idx in range(len(batch))]
+        vectorstore.add_documents(documents=batch, ids=ids)
 
     return vectorstore, chunks
 

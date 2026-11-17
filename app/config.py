@@ -35,6 +35,9 @@ class Settings:
     UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "uploads")
     CHROMA_DIR: str = os.getenv("CHROMA_DIR", "chroma_db")
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    MAX_UPLOAD_BYTES: int = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
+    EMBEDDING_BATCH_SIZE: int = int(os.getenv("EMBEDDING_BATCH_SIZE", "8"))
+    CHROMA_BATCH_SIZE: int = int(os.getenv("CHROMA_BATCH_SIZE", "16"))
 
 
 settings = Settings()

@@ -1,7 +1,9 @@
 import asyncio
 import json
+import logging
 import os
 import shutil
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -28,6 +30,10 @@ from app.redis_utils import (
     rate_limit_check,
     set_temp_state,
 )
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 # ---------- Global state ----------
@@ -109,17 +115,36 @@ async def upload_document(
     file: UploadFile = File(...),
     collection_name: str = Form("default"),
 ):
-    """Upload a PDF, index it, and prepare the retriever."""
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(400, "Only PDF files are supported.")
-
-    file_path = os.path.join(settings.UPLOAD_DIR, file.filename)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-
+    """Upload a PDF, index it, and prepare the retriever with safer memory handling."""
     global vectorstore, retriever, rag_chain_with_history
 
+    logger.info("UPLOAD: Request received")
+
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "Only PDF files are supported.")
+
+    safe_name = os.path.basename(file.filename.replace("\\", "/"))
+    safe_name = f"{uuid.uuid4().hex}_{safe_name}"
+    file_path = os.path.join(settings.UPLOAD_DIR, safe_name)
+    max_size = settings.MAX_UPLOAD_BYTES
+    total_size = 0
+
     try:
+        logger.info("UPLOAD: Saving %s with size limit %s bytes", file.filename, max_size)
+        with open(file_path, "wb") as buffer:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > max_size:
+                    raise HTTPException(413, "PDF exceeds the 10 MB upload limit.")
+                buffer.write(chunk)
+
+        if total_size == 0:
+            raise HTTPException(400, "Uploaded PDF is empty.")
+
+        logger.info("UPLOAD: Saved %s bytes; starting indexing", total_size)
         enqueue_job(
             "pdf_upload",
             {
@@ -129,24 +154,34 @@ async def upload_document(
             },
         )
 
-        vectorstore, chunks = create_vector_store(file_path, collection_name)
-        retriever = get_retriever(
+        vectorstore, chunks = await asyncio.to_thread(create_vector_store, file_path, collection_name)
+        logger.info("UPLOAD: Indexed %s chunks", len(chunks))
+
+        retriever = await asyncio.to_thread(
+            get_retriever,
             vectorstore,
-            k=settings.TOP_K,
-            fetch_k=settings.FETCH_K,
-            use_multi_query=settings.MULTI_QUERY,
-            llm=llm,
+            settings.TOP_K,
+            settings.FETCH_K,
+            settings.MULTI_QUERY,
+            llm,
         )
         rag_chain_with_history = build_rag_chain()
 
-        set_temp_state("documents", file.filename, {"collection_name": collection_name, "chunks": len(chunks)})
+        set_temp_state("documents", safe_name, {"collection_name": collection_name, "chunks": len(chunks)})
 
         return UploadResponse(
             message=f"✅ '{file.filename}' processed successfully.",
             chunks_count=len(chunks),
             collection_name=collection_name,
         )
+    except HTTPException:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise
     except Exception as exc:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        logger.exception("UPLOAD: Processing failed")
         raise HTTPException(500, f"Processing failed: {str(exc)}") from exc
 
 
