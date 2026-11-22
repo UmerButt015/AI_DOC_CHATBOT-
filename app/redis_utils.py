@@ -7,11 +7,34 @@ try:
 except ImportError:  # pragma: no cover
     redis = None
 
+try:
+    from upstash_redis import Redis as UpstashRedis
+except ImportError:  # pragma: no cover
+    UpstashRedis = None
+
 from app.config import settings
 
 
+_upstash_client = None
+
+
 def get_redis_client():
-    """Return a Redis client when Redis is configured and reachable."""
+    """Return an Upstash REST client or a standard Redis client when reachable."""
+    global _upstash_client
+
+    if settings.UPSTASH_REDIS_REST_URL and settings.UPSTASH_REDIS_REST_TOKEN:
+        if UpstashRedis is not None:
+            try:
+                if _upstash_client is None:
+                    _upstash_client = UpstashRedis(
+                        url=settings.UPSTASH_REDIS_REST_URL,
+                        token=settings.UPSTASH_REDIS_REST_TOKEN,
+                    )
+                _upstash_client.ping()
+                return _upstash_client
+            except Exception:
+                return None
+
     if not settings.REDIS_URL or redis is None:
         return None
 

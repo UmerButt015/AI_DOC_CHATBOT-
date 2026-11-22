@@ -23,7 +23,9 @@ class Settings:
     MAX_HISTORY_TOKENS: int = int(os.getenv("MAX_HISTORY_TOKENS", "2000"))
 
     # Redis / caching / session / rate limiting
-    REDIS_URL: Optional[str] = os.getenv("REDIS_URL")
+    REDIS_URL: Optional[str] = os.getenv("REDIS_URL") or None
+    UPSTASH_REDIS_REST_URL: Optional[str] = os.getenv("UPSTASH_REDIS_REST_URL") or None
+    UPSTASH_REDIS_REST_TOKEN: Optional[str] = os.getenv("UPSTASH_REDIS_REST_TOKEN") or None
     CACHE_TTL: int = int(os.getenv("CACHE_TTL", "3600"))
     TEMP_STATE_PREFIX: str = os.getenv("TEMP_STATE_PREFIX", "app:state:")
     TEMP_STATE_TTL: int = int(os.getenv("TEMP_STATE_TTL", "3600"))
