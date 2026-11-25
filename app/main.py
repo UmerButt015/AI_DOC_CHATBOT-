@@ -2,10 +2,11 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from langchain_core.output_parsers import StrOutputParser
@@ -26,7 +27,6 @@ from app.redis_utils import (
     cache_set,
     enqueue_job,
     get_queue_size,
-    get_temp_state,
     rate_limit_check,
     set_temp_state,
 )
@@ -46,10 +46,6 @@ rag_chain_with_history = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Create directories and initialize the LLM once at startup."""
-    if settings.PERSISTENT_DATA_DIR:
-        settings.UPLOAD_DIR = os.path.join(settings.PERSISTENT_DATA_DIR, "uploads")
-        settings.CHROMA_DIR = os.path.join(settings.PERSISTENT_DATA_DIR, "chroma_db")
-
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     os.makedirs(settings.CHROMA_DIR, exist_ok=True)
 
@@ -96,20 +92,10 @@ class ChatResponse(BaseModel):
     session_id: str
 
 
-class UploadJobResponse(BaseModel):
-    job_id: str
-    status: str
+class UploadResponse(BaseModel):
     message: str
+    chunks_count: int
     collection_name: str
-
-
-class UploadJobStatus(BaseModel):
-    job_id: str
-    status: str
-    filename: str
-    collection_name: str
-    chunks_count: int = 0
-    message: str
 
 
 def build_rag_chain():
@@ -124,22 +110,53 @@ def build_rag_chain():
     )
 
 
-async def process_pdf_job(job_id: str, file_path: str, original_filename: str, collection_name: str):
-    """Index an uploaded PDF outside the HTTP request lifecycle."""
+@app.post("/upload", response_model=UploadResponse)
+async def upload_document(
+    file: UploadFile = File(...),
+    collection_name: str = Form("default"),
+):
+    """Upload a PDF, index it, and prepare the retriever with safer memory handling."""
     global vectorstore, retriever, rag_chain_with_history
 
-    set_temp_state("upload_job", job_id, {
-        "job_id": job_id,
-        "status": "processing",
-        "filename": original_filename,
-        "collection_name": collection_name,
-        "chunks_count": 0,
-        "message": "PDF indexing in progress.",
-    })
+    logger.info("UPLOAD: Request received")
+
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "Only PDF files are supported.")
+
+    safe_name = os.path.basename(file.filename.replace("\\", "/"))
+    safe_name = f"{uuid.uuid4().hex}_{safe_name}"
+    file_path = os.path.join(settings.UPLOAD_DIR, safe_name)
+    max_size = settings.MAX_UPLOAD_BYTES
+    total_size = 0
 
     try:
-        logger.info("UPLOAD: Job %s indexing %s", job_id, original_filename)
+        logger.info("UPLOAD: Saving %s with size limit %s bytes", file.filename, max_size)
+        with open(file_path, "wb") as buffer:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > max_size:
+                    raise HTTPException(413, "PDF exceeds the 10 MB upload limit.")
+                buffer.write(chunk)
+
+        if total_size == 0:
+            raise HTTPException(400, "Uploaded PDF is empty.")
+
+        logger.info("UPLOAD: Saved %s bytes; starting indexing", total_size)
+        enqueue_job(
+            "pdf_upload",
+            {
+                "filename": file.filename,
+                "collection_name": collection_name,
+                "status": "queued",
+            },
+        )
+
         vectorstore, chunks = await asyncio.to_thread(create_vector_store, file_path, collection_name)
+        logger.info("UPLOAD: Indexed %s chunks", len(chunks))
+
         retriever = await asyncio.to_thread(
             get_retriever,
             vectorstore,
@@ -150,92 +167,11 @@ async def process_pdf_job(job_id: str, file_path: str, original_filename: str, c
         )
         rag_chain_with_history = build_rag_chain()
 
-        set_temp_state("upload_job", job_id, {
-            "job_id": job_id,
-            "status": "completed",
-            "filename": original_filename,
-            "collection_name": collection_name,
-            "chunks_count": len(chunks),
-            "message": f"'{original_filename}' processed successfully.",
-        })
-        logger.info("UPLOAD: Job %s indexed %s chunks", job_id, len(chunks))
-        if os.path.exists(file_path):
-            os.remove(file_path)
-    except Exception as exc:
-        logger.exception("UPLOAD: Job %s failed", job_id)
-        set_temp_state("upload_job", job_id, {
-            "job_id": job_id,
-            "status": "failed",
-            "filename": original_filename,
-            "collection_name": collection_name,
-            "chunks_count": 0,
-            "message": f"PDF processing failed: {str(exc)}",
-        })
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        set_temp_state("documents", safe_name, {"collection_name": collection_name, "chunks": len(chunks)})
 
-
-@app.post("/upload", response_model=UploadJobResponse, status_code=202)
-async def upload_document(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    collection_name: str = Form("default"),
-):
-    """Save a PDF immediately and process it asynchronously in a background task."""
-    logger.info("UPLOAD: Request received")
-
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(400, "Only PDF files are supported.")
-
-    original_filename = os.path.basename(file.filename.replace("\\", "/"))
-    safe_name = f"{uuid.uuid4().hex}_{original_filename}"
-    file_path = os.path.join(settings.UPLOAD_DIR, safe_name)
-    job_id = str(uuid.uuid4())
-    total_size = 0
-
-    try:
-        logger.info("UPLOAD: Saving %s with size limit %s bytes", original_filename, settings.MAX_UPLOAD_BYTES)
-        with open(file_path, "wb") as buffer:
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                total_size += len(chunk)
-                if total_size > settings.MAX_UPLOAD_BYTES:
-                    raise HTTPException(413, "PDF exceeds the 10 MB upload limit.")
-                buffer.write(chunk)
-
-        if total_size == 0:
-            raise HTTPException(400, "Uploaded PDF is empty.")
-
-        set_temp_state("upload_job", job_id, {
-            "job_id": job_id,
-            "status": "queued",
-            "filename": original_filename,
-            "collection_name": collection_name,
-            "chunks_count": 0,
-            "message": "PDF upload accepted and queued for indexing.",
-        })
-        enqueue_job("pdf_upload", {
-            "job_id": job_id,
-            "filename": original_filename,
-            "collection_name": collection_name,
-            "status": "queued",
-        })
-
-        background_tasks.add_task(
-            process_pdf_job,
-            job_id,
-            file_path,
-            original_filename,
-            collection_name,
-        )
-
-        logger.info("UPLOAD: Job %s queued after saving %s bytes", job_id, total_size)
-        return UploadJobResponse(
-            job_id=job_id,
-            status="queued",
-            message="PDF uploaded successfully. It is being indexed in the background.",
+        return UploadResponse(
+            message=f"✅ '{file.filename}' processed successfully.",
+            chunks_count=len(chunks),
             collection_name=collection_name,
         )
     except HTTPException:
@@ -245,17 +181,8 @@ async def upload_document(
     except Exception as exc:
         if os.path.exists(file_path):
             os.remove(file_path)
-        logger.exception("UPLOAD: File save failed")
-        raise HTTPException(500, f"Upload failed: {str(exc)}") from exc
-
-
-@app.get("/upload/status/{job_id}", response_model=UploadJobStatus)
-async def get_upload_status(job_id: str):
-    """Return the current PDF indexing status for a background job."""
-    status = get_temp_state("upload_job", job_id)
-    if status is None:
-        raise HTTPException(404, "Upload job not found.")
-    return UploadJobStatus(**status)
+        logger.exception("UPLOAD: Processing failed")
+        raise HTTPException(500, f"Processing failed: {str(exc)}") from exc
 
 
 @app.post("/chat", response_model=ChatResponse)
